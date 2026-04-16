@@ -594,59 +594,127 @@ function writeOutput({ sessionType, slug, title, summary, specPath, summaryBody,
   return outfile;
 }
 
-// ─── preview mode ────────────────────────────────────────────────────────────
-// Usage: node session-finalize.mjs --preview
-// Outputs a condensed conversation text to stdout so Claude can read it
-// before generating a summary (useful after /compact).
+// ─── draft mode ──────────────────────────────────────────────────────────────
+// Usage: node session-finalize.mjs --draft <slug>
+// Creates the archive file with full timeline but placeholder summary.
+// No stdin needed. Prints the output file path to stdout.
 
-function renderPreview(messages) {
-  const lines = [];
-  let turnNum = 0;
-  for (const m of messages) {
-    if (m.isCommand) {
-      if (m.commandArgs) lines.push(`[录制开始] 主题: ${m.commandArgs}`);
-      continue;
-    }
-    if (m.type === 'user') {
-      turnNum++;
-      lines.push(`\n--- #${turnNum} 用户 (${m.localTime}) ---`);
-      lines.push(m.text || '(empty)');
-    } else {
-      const toolNames = m.toolCalls.map(tc => {
-        const s = tc.summary ? `${tc.name}: ${tc.summary}` : tc.name;
-        return `[${s}]`;
-      });
-      if (toolNames.length) lines.push(`工具: ${toolNames.join(', ')}`);
-      if (m.text) {
-        // Truncate long Claude responses to keep preview manageable
-        const truncated = m.text.length > 500
-          ? m.text.slice(0, 500) + '...(truncated)'
-          : m.text;
-        lines.push(truncated);
-      }
-    }
-  }
-  return lines.join('\n');
-}
+const SUMMARY_PLACEHOLDER = '<!-- SUMMARY_PLACEHOLDER: 待 Claude 生成摘要后填入 -->';
+
+// ─── fill-summary mode ───────────────────────────────────────────────────────
+// Usage: cat <<'EOF' | node session-finalize.mjs --fill-summary <filepath>
+// Reads summary from stdin, replaces the placeholder in the file, updates INDEX.md.
 
 // ─── main ────────────────────────────────────────────────────────────────────
 
 async function main() {
-  const isPreview = process.argv.includes('--preview');
+  const args = process.argv.slice(2);
+  const isDraft = args.includes('--draft');
+  const fillIdx = args.indexOf('--fill-summary');
+  const isFill = fillIdx !== -1;
 
-  if (isPreview) {
-    // Preview mode: no stdin needed, just extract and print conversation text
+  if (isDraft) {
+    // --draft <slug> [--title "..."] [--spec_path "..."]
+    const slugArg = args[args.indexOf('--draft') + 1];
+    if (!slugArg || slugArg.startsWith('--')) die('--draft requires a slug argument');
+    const slug = sanitizeSlug(slugArg);
+    validateSlug(slug);
+
+    const titleIdx = args.indexOf('--title');
+    const title = titleIdx !== -1 ? (args[titleIdx + 1] || '') : '';
+    const specIdx = args.indexOf('--spec_path');
+    const specPath = specIdx !== -1 ? (args[specIdx + 1] || '') : '';
+
     const transcriptPath = findTranscript();
-    const { startTs, endTs } = findBoundary(transcriptPath);
+    const { startTs, endTs, sessionType } = findBoundary(transcriptPath);
     const messages = extractMessages(transcriptPath, startTs, endTs);
+
     if (!messages.some(m => !m.isCommand)) {
       die('empty timeline body (no messages since session start)');
     }
-    console.log(renderPreview(messages));
+
+    const turns = buildTurns(messages);
+    const toc = generateTOC(turns);
+    const timeline = renderTimeline(turns);
+    const stats = computeStats(messages, turns);
+
+    const outfile = writeOutput({
+      sessionType, slug, title, summary: '',  specPath,
+      summaryBody: SUMMARY_PLACEHOLDER,
+      toc, timeline, stats,
+    });
+
+    console.log(`session-finalize: wrote ${outfile}`);
     return;
   }
 
-  // Normal mode: read stdin, process, write archive
+  if (isFill) {
+    // --fill-summary <filepath>
+    const filepath = args[fillIdx + 1];
+    if (!filepath || !existsSync(filepath)) die(`--fill-summary: file not found: ${filepath}`);
+
+    // Read summary from stdin
+    const chunks = [];
+    for await (const chunk of process.stdin) chunks.push(chunk);
+    const stdinText = Buffer.concat(chunks).toString('utf8');
+    const { slug, title, summary, body } = parseStdin(stdinText);
+
+    // Read existing file and replace placeholder
+    let content = readFileSync(filepath, 'utf8');
+    if (!content.includes(SUMMARY_PLACEHOLDER)) {
+      die('placeholder not found in file — was --draft run first?');
+    }
+    content = content.replace(SUMMARY_PLACEHOLDER, body);
+
+    // Also update title/summary in header if they were empty
+    if (title && !content.includes(`**Title:** ${title}`)) {
+      content = content.replace(/\*\*Slug:\*\* `[^`]+`/, m => `${m}\n**Title:** ${title}`);
+    }
+    if (summary) {
+      content = content.replace(/\*\*Slug:\*\*[^\n]*\n/, m => {
+        if (content.includes('**Summary:**')) {
+          return m;
+        }
+        return m + `**Summary:** ${summary}\n`;
+      });
+    }
+
+    writeFileSync(filepath, content);
+
+    // Update INDEX.md with real title/summary
+    const indexPath = join(ARCHIVE_DIR, 'INDEX.md');
+    if (existsSync(indexPath)) {
+      const filename = basename(filepath);
+      let idx = readFileSync(indexPath, 'utf8');
+      // Find the row for this file and update title/summary
+      const rowRe = new RegExp(`\\|[^|]*\\|[^|]*\\|[^|]*\\|[^|]*\\|[^|]*\\|[^|]*\\| \\[${filename.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\]`);
+      if (rowRe.test(idx)) {
+        // Row exists from --draft, update it
+        const dateStamp = new Date().toISOString().slice(0, 10);
+        const slugFromFile = filename.replace(/^\d{4}-\d{2}-\d{2}-/, '').replace(/(-\d+)?\.md$/, '');
+        const sessionType = content.match(/\*\*Session type:\*\* `([^`]+)`/)?.[1] || 'session_record';
+        const specPath = content.match(/\*\*Spec doc:\*\* `([^`]+)`/)?.[1] || '';
+        const newRow = `| ${dateStamp} | ${sessionType} | ${slugFromFile} | ${title || '—'} | ${summary || '—'} | ${specPath || '—'} | [${filename}](${filename}) |`;
+        idx = idx.replace(rowRe.source.replace('\\|', '|'), line => {
+          // Replace the entire line
+          return '';
+        });
+        // Simpler: just replace the line containing the filename
+        const lines = idx.split('\n');
+        const lineIdx = lines.findIndex(l => l.includes(`[${filename}]`));
+        if (lineIdx !== -1) {
+          lines[lineIdx] = newRow;
+          idx = lines.join('\n');
+        }
+        writeFileSync(indexPath, idx);
+      }
+    }
+
+    console.log(`session-finalize: updated ${filepath}`);
+    return;
+  }
+
+  // Legacy normal mode: read stdin with full frontmatter, process, write archive
   const chunks = [];
   for await (const chunk of process.stdin) chunks.push(chunk);
   const stdinText = Buffer.concat(chunks).toString('utf8');
