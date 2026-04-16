@@ -594,10 +594,59 @@ function writeOutput({ sessionType, slug, title, summary, specPath, summaryBody,
   return outfile;
 }
 
+// ─── preview mode ────────────────────────────────────────────────────────────
+// Usage: node session-finalize.mjs --preview
+// Outputs a condensed conversation text to stdout so Claude can read it
+// before generating a summary (useful after /compact).
+
+function renderPreview(messages) {
+  const lines = [];
+  let turnNum = 0;
+  for (const m of messages) {
+    if (m.isCommand) {
+      if (m.commandArgs) lines.push(`[录制开始] 主题: ${m.commandArgs}`);
+      continue;
+    }
+    if (m.type === 'user') {
+      turnNum++;
+      lines.push(`\n--- #${turnNum} 用户 (${m.localTime}) ---`);
+      lines.push(m.text || '(empty)');
+    } else {
+      const toolNames = m.toolCalls.map(tc => {
+        const s = tc.summary ? `${tc.name}: ${tc.summary}` : tc.name;
+        return `[${s}]`;
+      });
+      if (toolNames.length) lines.push(`工具: ${toolNames.join(', ')}`);
+      if (m.text) {
+        // Truncate long Claude responses to keep preview manageable
+        const truncated = m.text.length > 500
+          ? m.text.slice(0, 500) + '...(truncated)'
+          : m.text;
+        lines.push(truncated);
+      }
+    }
+  }
+  return lines.join('\n');
+}
+
 // ─── main ────────────────────────────────────────────────────────────────────
 
 async function main() {
-  // Read stdin
+  const isPreview = process.argv.includes('--preview');
+
+  if (isPreview) {
+    // Preview mode: no stdin needed, just extract and print conversation text
+    const transcriptPath = findTranscript();
+    const { startTs, endTs } = findBoundary(transcriptPath);
+    const messages = extractMessages(transcriptPath, startTs, endTs);
+    if (!messages.some(m => !m.isCommand)) {
+      die('empty timeline body (no messages since session start)');
+    }
+    console.log(renderPreview(messages));
+    return;
+  }
+
+  // Normal mode: read stdin, process, write archive
   const chunks = [];
   for await (const chunk of process.stdin) chunks.push(chunk);
   const stdinText = Buffer.concat(chunks).toString('utf8');
