@@ -17,10 +17,8 @@ echo "  Installed commands: session_record_start, session_record_done"
 
 # Copy scripts
 cp scripts/session-finalize.mjs "${CLAUDE_DIR}/scripts/"
-cp scripts/session-finalize.sh "${CLAUDE_DIR}/scripts/"
 chmod +x "${CLAUDE_DIR}/scripts/session-finalize.mjs"
-chmod +x "${CLAUDE_DIR}/scripts/session-finalize.sh"
-echo "  Installed scripts: session-finalize.mjs, session-finalize.sh"
+echo "  Installed scripts: session-finalize.mjs"
 
 echo ""
 echo "Done! Usage:"

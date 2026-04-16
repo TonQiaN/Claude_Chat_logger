@@ -21,8 +21,7 @@ commands/
   session_record_start.md   # Slash command: marks recording start
   session_record_done.md    # Slash command: ends recording, triggers archival
 scripts/
-  session-finalize.mjs      # Node.js archival script (primary)
-  session-finalize.sh       # Bash+jq archival script (legacy fallback)
+  session-finalize.mjs      # Node.js archival script
 ```
 
 ## Installation
@@ -36,9 +35,7 @@ cp commands/session_record_done.md ~/.claude/commands/
 
 # Scripts
 cp scripts/session-finalize.mjs ~/.claude/scripts/
-cp scripts/session-finalize.sh ~/.claude/scripts/
 chmod +x ~/.claude/scripts/session-finalize.mjs
-chmod +x ~/.claude/scripts/session-finalize.sh
 ```
 
 **Requirements:** Node.js (for `session-finalize.mjs`). No npm packages needed.
