@@ -15,8 +15,6 @@ description: 开始录制会话。从这里开始的所有用户输入和 Claude
 
 > 📍 会话录制已开始。主题: **<用户给的主题或"自由讨论">**。结束时敲 `/session_record_done` 归档完整对话。
 
-3. 然后正常工作。就是正常干活。
-
 ## 关键规则
 
 - 这个 command 的唯一作用是在 transcript 里留一个时间戳标记，让 `/session_record_done` 知道从哪里开始截取
