@@ -18,7 +18,7 @@
 //   SESSION_START_FROM  — ISO-8601 override for start time
 
 import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync, statSync } from 'fs';
-import { join, basename } from 'path';
+import { join, basename, dirname } from 'path';
 import { execSync } from 'child_process';
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -528,37 +528,26 @@ function computeStats(messages, turns) {
   ].join('\n');
 }
 
-// ─── writeOutput ─────────────────────────────────────────────────────────────
+// ─── content builders ────────────────────────────────────────────────────────
 
-function writeOutput({ sessionType, slug, title, summary, specPath, summaryBody, toc, timeline, stats }) {
-  mkdirSync(ARCHIVE_DIR, { recursive: true });
-  const dateStamp = new Date().toISOString().slice(0, 10);
-  const projectName = basename(process.cwd()).replace(/[^A-Za-z0-9_.-]/g, '-');
-  const headerLabel = SESSION_TYPE_LABELS[sessionType] || 'Session Record';
-
-  // Collision handling
-  let outfile = join(ARCHIVE_DIR, `${dateStamp}-${slug}.md`);
-  let n = 2;
-  while (existsSync(outfile)) {
-    outfile = join(ARCHIVE_DIR, `${dateStamp}-${slug}-${n}.md`);
-    n++;
-  }
-
-  // Build file content
+function buildHeader({ headerLabel, dateStamp, projectName, cwd, sessionType, slug, title, summary, specPath }) {
   const header = [
     `# ${headerLabel}: ${dateStamp}`,
     '',
     `**Project:** \`${projectName}\``,
-    `**Working dir:** \`${process.cwd()}\``,
+    `**Working dir:** \`${cwd}\``,
     `**Session type:** \`${sessionType}\``,
     `**Slug:** \`${slug}\``,
   ];
   if (title) header.push(`**Title:** ${title}`);
   if (summary) header.push(`**Summary:** ${summary}`);
   if (specPath) header.push(`**Spec doc:** \`${specPath}\``);
+  return header.join('\n');
+}
 
-  const content = [
-    header.join('\n'),
+function buildFullContent({ header, summaryBody, toc, timeline, stats }) {
+  return [
+    header,
     '',
     '---',
     '',
@@ -573,25 +562,147 @@ function writeOutput({ sessionType, slug, title, summary, specPath, summaryBody,
     timeline,
     stats,
   ].join('\n');
+}
 
-  writeFileSync(outfile, content);
+function renderUserPrompts(turns) {
+  const blocks = [];
+  let textIdx = 0;
 
-  // Update INDEX.md
+  for (const t of turns) {
+    if (t.role === 'opener') {
+      const body = (t.text || '').replace(/\n/g, '\n> ');
+      blocks.push(
+        `### 🚀 \`${t.localTime}\` 斜杠命令 \`/${t.commandName || 'unknown'}\`\n\n> ${body}`
+      );
+      continue;
+    }
+
+    if (t.role === 'user') {
+      textIdx++;
+      const body = (t.text || '').replace(/\n/g, '\n> ');
+      blocks.push(
+        `### 💬 \`${t.localTime}\` 文本消息 #${textIdx}\n\n> ${body}`
+      );
+      continue;
+    }
+
+    if (t.role === 'claude') {
+      for (const tc of t.toolCalls) {
+        if (tc.name !== 'AskUserQuestion' || !tc.result) continue;
+        const parsed = parseAskUserResult(tc.result);
+        if (parsed && parsed.pairs.length) {
+          for (const p of parsed.pairs) {
+            const notes = parsed.notes ? `\n>\n> *备注: ${parsed.notes}*` : '';
+            blocks.push(
+              `### ✅ \`${t.localTime}\` 交互选择 — ${p.question}\n\n> **${p.answer}**${notes}`
+            );
+          }
+        } else {
+          blocks.push(
+            `### ✅ \`${t.localTime}\` 交互选择\n\n> ${tc.result.slice(0, 200)}`
+          );
+        }
+      }
+    }
+  }
+
+  if (blocks.length === 0) return '*(无用户消息)*';
+  return blocks.join('\n\n---\n\n') + '\n';
+}
+
+function buildOnlypromptContent({ header, summaryBody, stats, userPrompts }) {
+  return [
+    header,
+    '',
+    '---',
+    '',
+    '# 📋 会议总结',
+    '',
+    summaryBody,
+    '',
+    '---',
+    '',
+    '# 🧑 用户输入时间线',
+    '',
+    '> 按时间顺序列出用户的全部输入：斜杠命令、文本消息、交互式选项。',
+    '',
+    userPrompts,
+    '',
+    stats,
+  ].join('\n');
+}
+
+// ─── INDEX.md helpers ────────────────────────────────────────────────────────
+
+function ensureIndex() {
   const indexPath = join(ARCHIVE_DIR, 'INDEX.md');
   if (!existsSync(indexPath)) {
     writeFileSync(indexPath, [
       '# 设计讨论 Session 归档索引',
       '',
-      '| 日期 | 类型 | Slug | 主题 | 一句话摘要 | Spec | 文件 |',
+      '| 日期 | 类型 | Slug | 主题 | 一句话摘要 | Spec | 目录 |',
       '|---|---|---|---|---|---|---|',
       '',
     ].join('\n'));
   }
-  const filename = basename(outfile);
-  const row = `| ${dateStamp} | ${sessionType} | ${slug} | ${title || '—'} | ${summary || '—'} | ${specPath || '—'} | [${filename}](${filename}) |\n`;
-  writeFileSync(indexPath, readFileSync(indexPath, 'utf8') + row);
+  return indexPath;
+}
 
-  return outfile;
+function appendIndexRow({ dateStamp, sessionType, slug, title, summary, specPath, folderName }) {
+  const indexPath = ensureIndex();
+  const row = `| ${dateStamp} | ${sessionType} | ${slug} | ${title || '—'} | ${summary || '—'} | ${specPath || '—'} | [${folderName}/](${folderName}/) |\n`;
+  writeFileSync(indexPath, readFileSync(indexPath, 'utf8') + row);
+}
+
+function updateIndexRow({ dateStamp, sessionType, slug, title, summary, specPath, folderName }) {
+  const indexPath = join(ARCHIVE_DIR, 'INDEX.md');
+  if (!existsSync(indexPath)) return;
+  const idx = readFileSync(indexPath, 'utf8');
+  const lines = idx.split('\n');
+  const lineIdx = lines.findIndex(l => l.includes(`[${folderName}/]`));
+  if (lineIdx === -1) return;
+  lines[lineIdx] = `| ${dateStamp} | ${sessionType} | ${slug} | ${title || '—'} | ${summary || '—'} | ${specPath || '—'} | [${folderName}/](${folderName}/) |`;
+  writeFileSync(indexPath, lines.join('\n'));
+}
+
+// ─── writeOutput ─────────────────────────────────────────────────────────────
+// Creates docs/sessions/YYYY-MM-DD-<slug>/ and writes full.md (always).
+// Writes onlyprompt.md only when writeOnlyprompt === true (i.e. summary is real, not placeholder).
+
+function writeOutput({ sessionType, slug, title, summary, specPath, summaryBody, toc, timeline, stats, userPrompts, writeOnlyprompt = false }) {
+  mkdirSync(ARCHIVE_DIR, { recursive: true });
+  const dateStamp = new Date().toISOString().slice(0, 10);
+  const projectName = basename(process.cwd()).replace(/[^A-Za-z0-9_.-]/g, '-');
+  const headerLabel = SESSION_TYPE_LABELS[sessionType] || 'Session Record';
+
+  // Folder-level collision handling
+  const folderBase = `${dateStamp}-${slug}`;
+  let folderName = folderBase;
+  let folder = join(ARCHIVE_DIR, folderName);
+  let n = 2;
+  while (existsSync(folder)) {
+    folderName = `${folderBase}-${n}`;
+    folder = join(ARCHIVE_DIR, folderName);
+    n++;
+  }
+  mkdirSync(folder, { recursive: true });
+
+  const header = buildHeader({
+    headerLabel, dateStamp, projectName, cwd: process.cwd(),
+    sessionType, slug, title, summary, specPath,
+  });
+
+  const fullContent = buildFullContent({ header, summaryBody, toc, timeline, stats });
+  writeFileSync(join(folder, 'full.md'), fullContent);
+
+  if (writeOnlyprompt) {
+    const onlypromptContent = buildOnlypromptContent({ header, summaryBody, stats, userPrompts });
+    writeFileSync(join(folder, 'onlyprompt.md'), onlypromptContent);
+  }
+
+  appendIndexRow({ dateStamp, sessionType, slug, title, summary, specPath, folderName });
+
+  return folder;
 }
 
 // ─── draft mode ──────────────────────────────────────────────────────────────
@@ -602,8 +713,17 @@ function writeOutput({ sessionType, slug, title, summary, specPath, summaryBody,
 const SUMMARY_PLACEHOLDER = '<!-- SUMMARY_PLACEHOLDER: 待 Claude 生成摘要后填入 -->';
 
 // ─── fill-summary mode ───────────────────────────────────────────────────────
-// Usage: cat <<'EOF' | node session-finalize.mjs --fill-summary <filepath>
-// Reads summary from stdin, replaces the placeholder in the file, updates INDEX.md.
+// Usage: cat <<'EOF' | node session-finalize.mjs --fill-summary <folder_or_full_md_path>
+// Reads summary from stdin, rebuilds full.md with real summary and writes onlyprompt.md.
+// Accepts either the folder path (preferred) or a path to full.md inside it.
+
+function resolveSessionFolder(p) {
+  if (!p || !existsSync(p)) die(`--fill-summary: path not found: ${p}`);
+  const st = statSync(p);
+  if (st.isDirectory()) return p;
+  if (st.isFile() && basename(p) === 'full.md') return dirname(p);
+  die(`--fill-summary: expected folder or full.md path, got: ${p}`);
+}
 
 // ─── main ────────────────────────────────────────────────────────────────────
 
@@ -638,79 +758,70 @@ async function main() {
     const timeline = renderTimeline(turns);
     const stats = computeStats(messages, turns);
 
-    const outfile = writeOutput({
-      sessionType, slug, title, summary: '',  specPath,
+    const userPrompts = renderUserPrompts(turns);
+    const folder = writeOutput({
+      sessionType, slug, title, summary: '', specPath,
       summaryBody: SUMMARY_PLACEHOLDER,
-      toc, timeline, stats,
+      toc, timeline, stats, userPrompts,
+      writeOnlyprompt: true,
     });
 
-    console.log(`session-finalize: wrote ${outfile}`);
+    console.log(`session-finalize: wrote ${folder}`);
     return;
   }
 
   if (isFill) {
-    // --fill-summary <filepath>
-    const filepath = args[fillIdx + 1];
-    if (!filepath || !existsSync(filepath)) die(`--fill-summary: file not found: ${filepath}`);
+    const folderPath = resolveSessionFolder(args[fillIdx + 1]);
+    const fullPath = join(folderPath, 'full.md');
+    if (!existsSync(fullPath)) die(`full.md not found in ${folderPath}`);
 
     // Read summary from stdin
     const chunks = [];
     for await (const chunk of process.stdin) chunks.push(chunk);
     const stdinText = Buffer.concat(chunks).toString('utf8');
-    const { slug, title, summary, body } = parseStdin(stdinText);
+    const { title, summary, body } = parseStdin(stdinText);
 
-    // Read existing file and replace placeholder
-    let content = readFileSync(filepath, 'utf8');
-    if (!content.includes(SUMMARY_PLACEHOLDER)) {
-      die('placeholder not found in file — was --draft run first?');
+    // Carry forward metadata from the draft's full.md
+    const draftContent = readFileSync(fullPath, 'utf8');
+    if (!draftContent.includes(SUMMARY_PLACEHOLDER)) {
+      die('placeholder not found in full.md — was --draft run first?');
     }
-    content = content.replace(SUMMARY_PLACEHOLDER, body);
+    const slugFromDraft = draftContent.match(/\*\*Slug:\*\* `([^`]+)`/)?.[1] || '';
+    const specPath = draftContent.match(/\*\*Spec doc:\*\* `([^`]+)`/)?.[1] || '';
+    const sessionType = draftContent.match(/\*\*Session type:\*\* `([^`]+)`/)?.[1] || 'session_record';
 
-    // Also update title/summary in header if they were empty
-    if (title && !content.includes(`**Title:** ${title}`)) {
-      content = content.replace(/\*\*Slug:\*\* `[^`]+`/, m => `${m}\n**Title:** ${title}`);
-    }
-    if (summary) {
-      content = content.replace(/\*\*Slug:\*\*[^\n]*\n/, m => {
-        if (content.includes('**Summary:**')) {
-          return m;
-        }
-        return m + `**Summary:** ${summary}\n`;
-      });
-    }
+    const folderName = basename(folderPath);
+    const dateStamp = folderName.match(/^(\d{4}-\d{2}-\d{2})/)?.[1]
+      || new Date().toISOString().slice(0, 10);
+    const projectName = basename(process.cwd()).replace(/[^A-Za-z0-9_.-]/g, '-');
+    const headerLabel = SESSION_TYPE_LABELS[sessionType] || 'Session Record';
 
-    writeFileSync(filepath, content);
+    // Re-extract transcript for fresh timeline/stats
+    const transcriptPath = findTranscript();
+    const { startTs, endTs } = findBoundary(transcriptPath);
+    const messages = extractMessages(transcriptPath, startTs, endTs);
+    const turns = buildTurns(messages);
+    const toc = generateTOC(turns);
+    const timeline = renderTimeline(turns);
+    const stats = computeStats(messages, turns);
 
-    // Update INDEX.md with real title/summary
-    const indexPath = join(ARCHIVE_DIR, 'INDEX.md');
-    if (existsSync(indexPath)) {
-      const filename = basename(filepath);
-      let idx = readFileSync(indexPath, 'utf8');
-      // Find the row for this file and update title/summary
-      const rowRe = new RegExp(`\\|[^|]*\\|[^|]*\\|[^|]*\\|[^|]*\\|[^|]*\\|[^|]*\\| \\[${filename.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\]`);
-      if (rowRe.test(idx)) {
-        // Row exists from --draft, update it
-        const dateStamp = new Date().toISOString().slice(0, 10);
-        const slugFromFile = filename.replace(/^\d{4}-\d{2}-\d{2}-/, '').replace(/(-\d+)?\.md$/, '');
-        const sessionType = content.match(/\*\*Session type:\*\* `([^`]+)`/)?.[1] || 'session_record';
-        const specPath = content.match(/\*\*Spec doc:\*\* `([^`]+)`/)?.[1] || '';
-        const newRow = `| ${dateStamp} | ${sessionType} | ${slugFromFile} | ${title || '—'} | ${summary || '—'} | ${specPath || '—'} | [${filename}](${filename}) |`;
-        idx = idx.replace(rowRe.source.replace('\\|', '|'), line => {
-          // Replace the entire line
-          return '';
-        });
-        // Simpler: just replace the line containing the filename
-        const lines = idx.split('\n');
-        const lineIdx = lines.findIndex(l => l.includes(`[${filename}]`));
-        if (lineIdx !== -1) {
-          lines[lineIdx] = newRow;
-          idx = lines.join('\n');
-        }
-        writeFileSync(indexPath, idx);
-      }
-    }
+    const header = buildHeader({
+      headerLabel, dateStamp, projectName, cwd: process.cwd(),
+      sessionType, slug: slugFromDraft, title, summary, specPath,
+    });
 
-    console.log(`session-finalize: updated ${filepath}`);
+    const userPrompts = renderUserPrompts(turns);
+    const fullContent = buildFullContent({ header, summaryBody: body, toc, timeline, stats });
+    const onlypromptContent = buildOnlypromptContent({ header, summaryBody: body, stats, userPrompts });
+
+    writeFileSync(fullPath, fullContent);
+    writeFileSync(join(folderPath, 'onlyprompt.md'), onlypromptContent);
+
+    updateIndexRow({
+      dateStamp, sessionType, slug: slugFromDraft, title, summary, specPath, folderName,
+    });
+
+    console.log(`session-finalize: updated ${folderPath}`);
     return;
   }
 
@@ -735,13 +846,15 @@ async function main() {
   const timeline = renderTimeline(turns);
   const stats = computeStats(messages, turns);
 
-  const outfile = writeOutput({
+  const userPrompts = renderUserPrompts(turns);
+  const folder = writeOutput({
     sessionType, slug, title, summary, specPath,
     summaryBody: body,
-    toc, timeline, stats,
+    toc, timeline, stats, userPrompts,
+    writeOnlyprompt: true,
   });
 
-  console.log(`session-finalize: wrote ${outfile}`);
+  console.log(`session-finalize: wrote ${folder}`);
 }
 
 main().catch(err => {
