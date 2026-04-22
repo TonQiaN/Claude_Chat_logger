@@ -162,6 +162,22 @@ function findTranscript() {
     .sort((a, b) => b.mtime - a.mtime);
 
   if (!jsonls.length) die(`no .jsonl transcript in ${root}`);
+
+  // When multiple Claude sessions are active in the same project directory,
+  // their .jsonl files all live in the same folder. Picking by mtime alone
+  // can select another session's transcript — the one just written by
+  // whichever process flushed most recently. Prefer jsonls that actually
+  // contain session-record command markers; among those, pick newest mtime.
+  // Fall back to newest mtime overall if none match (preserves prior behavior
+  // for non-session-record invocations).
+  const markerPattern = /<command-name>\/(session_record_start|session_record_done|my_brainstorm|grill-me|grill-done|session-done)<\/command-name>/;
+  for (const { name } of jsonls) {
+    const path = join(root, name);
+    try {
+      if (markerPattern.test(readFileSync(path, 'utf8'))) return path;
+    } catch { /* unreadable file, skip */ }
+  }
+
   return join(root, jsonls[0].name);
 }
 
